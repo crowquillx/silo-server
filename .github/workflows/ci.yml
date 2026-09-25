@@ -245,6 +245,22 @@ jobs:
       - name: Test
         run: make test-go
 
+      - name: Install FFmpeg for audio remux regression tests
+        run: |
+          apt_options=(
+            -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources
+            -o Dir::Etc::sourceparts=-
+          )
+          sudo apt-get "${apt_options[@]}" install -y --no-install-recommends ffmpeg
+          ffmpeg -version
+          ffprobe -version
+
+      - name: Test theme audio with FFmpeg
+        run: >-
+          go test -count=1
+          -run '^(TestAudioOnlyRemuxProducesDecodableFragments|TestThemePlaybackInfoConvertsThroughAdvertisedStream)$'
+          ./internal/playback ./internal/jellycompat
+
   # make test-go has no database, so every DB-backed test in it skips, and go
   # test counts a skip as a pass. This job migrates a fresh database and runs
   # the query-budget pins listed in scripts/ci/db-pins.txt, failing when one

@@ -47,8 +47,8 @@ func TestAudioOnlyRemuxProducesDecodableFragments(t *testing.T) {
 		}
 		offset += size
 	}
-	if fragments < 2 {
-		t.Fatalf("audio streamed as %d unbounded fragments", fragments)
+	if fragments < 100 || fragments > 110 {
+		t.Fatalf("107 seconds of audio produced %d fragments; expected about one per second", fragments)
 	}
 	output := filepath.Join(dir, "theme.m4a")
 	if err := os.WriteFile(output, data, 0600); err != nil {

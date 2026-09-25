@@ -8,12 +8,14 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/streamtelemetry"
 	"github.com/Silo-Server/silo-server/internal/themedelivery"
 	"github.com/Silo-Server/silo-server/internal/themesongs"
@@ -70,39 +72,46 @@ func TestThemePlaybackInfoResolvesAuthorizedAudio(t *testing.T) {
 	router.Get("/Items/{id}/PlaybackInfo", playback.HandlePlaybackInfo)
 	router.Post("/Items/{id}/PlaybackInfo", playback.HandlePlaybackInfo)
 	router.Get("/Users/{userId}/Items/{id}/PlaybackInfo", playback.HandlePlaybackInfo)
+	router.Post("/Users/{userId}/Items/{id}/PlaybackInfo", playback.HandlePlaybackInfo)
 	router.With(PlaybackSessionAuth(sessions, nil, nil)).Get("/Audio/{itemId}/stream.ogg", items.HandleThemeAudio)
 	id := EncodeNumericID(EncodedIDThemeSong, 8).String()
 	request := func(method, url, body, profile string, authenticated bool) *httptest.ResponseRecorder {
 		t.Helper()
 		r := httptest.NewRequest(method, url, strings.NewReader(body))
 		if authenticated {
-			r = r.WithContext(context.WithValue(r.Context(), compatSessionKey, &Session{Token: "test-token", StreamAppUserID: 4, ProfileID: profile}))
+			r = r.WithContext(context.WithValue(r.Context(), compatSessionKey, &Session{Token: "test-token", StreamAppUserID: 4, ProfileID: profile, PseudoUserID: PseudoUserID(4, profile)}))
 		}
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, r)
 		return w
 	}
 	var streamURL string
-	for _, method := range []string{http.MethodGet, http.MethodPost} {
-		w := request(method, "/Items/"+id+"/PlaybackInfo", `{}`, "allowed", true)
-		if w.Code != http.StatusOK {
-			t.Fatalf("%s PlaybackInfo status=%d body=%s", method, w.Code, w.Body.String())
-		}
-		var result playbackInfoResponseDTO
-		if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
-			t.Fatal(err)
-		}
-		if len(result.MediaSources) != 1 || result.MediaSources[0].ID != id || !result.MediaSources[0].SupportsDirectPlay || result.MediaSources[0].SupportsTranscoding {
-			t.Fatalf("%s PlaybackInfo sources=%+v", method, result.MediaSources)
-		}
-		source := result.MediaSources[0]
-		if source.Path != "" || source.Container != "ogg" || source.DefaultAudioStreamIndex == nil || *source.DefaultAudioStreamIndex != 0 || len(source.MediaStreams) != 1 || source.MediaStreams[0].Type != "Audio" || source.MediaStreams[0].Codec != "vorbis" {
-			t.Fatalf("%s PlaybackInfo metadata=%+v", method, source)
-		}
-		streamURL = source.DirectStreamURL
-		parsed, err := url.Parse(streamURL)
-		if err != nil || parsed.Path != "/Audio/"+id+"/stream.ogg" || parsed.Query().Get("static") != "true" || parsed.Query().Get("api_key") != "test-token" || result.PlaySessionID != "" {
-			t.Fatalf("%s PlaybackInfo stream=%q session=%q", method, streamURL, result.PlaySessionID)
+	for _, prefix := range []string{"", "/Users/" + PseudoUserID(4, "allowed").String()} {
+		for _, method := range []string{http.MethodGet, http.MethodPost} {
+			target := prefix + "/Items/" + id + "/PlaybackInfo"
+			if method == http.MethodGet {
+				target += "?AudioStreamIndex=0&StartTimeTicks=10000000"
+			}
+			w := request(method, target, `{"AudioStreamIndex":0,"StartTimeTicks":10000000}`, "allowed", true)
+			if w.Code != http.StatusOK {
+				t.Fatalf("%s PlaybackInfo status=%d body=%s", method, w.Code, w.Body.String())
+			}
+			var result playbackInfoResponseDTO
+			if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+			if len(result.MediaSources) != 1 || result.MediaSources[0].ID != id || !result.MediaSources[0].SupportsDirectPlay || result.MediaSources[0].SupportsTranscoding {
+				t.Fatalf("%s PlaybackInfo sources=%+v", method, result.MediaSources)
+			}
+			source := result.MediaSources[0]
+			if source.Path != "" || source.Container != "ogg" || source.DefaultAudioStreamIndex == nil || *source.DefaultAudioStreamIndex != 0 || len(source.MediaStreams) != 1 || source.MediaStreams[0].Type != "Audio" || source.MediaStreams[0].Codec != "vorbis" {
+				t.Fatalf("%s PlaybackInfo metadata=%+v", method, source)
+			}
+			streamURL = source.DirectStreamURL
+			parsed, err := url.Parse(streamURL)
+			if err != nil || parsed.Path != "/Audio/"+id+"/stream.ogg" || parsed.Query().Get("static") != "true" || parsed.Query().Get("api_key") != "test-token" || parsed.Query().Has("startTimeTicks") || parsed.Query().Has("audioStreamIndex") || result.PlaySessionID != "" {
+				t.Fatalf("%s PlaybackInfo stream=%q session=%q", method, streamURL, result.PlaySessionID)
+			}
 		}
 	}
 	if store.lastFilter.UserID != 4 || store.lastFilter.ProfileID != "allowed" {
@@ -112,7 +121,7 @@ func TestThemePlaybackInfoResolvesAuthorizedAudio(t *testing.T) {
 	if w.Code != http.StatusOK || w.Body.String() != "0123456789" {
 		t.Fatalf("stream status=%d body=%s", w.Code, w.Body.String())
 	}
-	ranged := httptest.NewRequest(http.MethodGet, streamURL, nil)
+	ranged := httptest.NewRequest(http.MethodGet, streamURL+"&audioStreamIndex=0", nil)
 	ranged.Header.Set("Range", "bytes=2-4")
 	w = httptest.NewRecorder()
 	router.ServeHTTP(w, ranged)
@@ -146,8 +155,8 @@ func TestThemePlaybackInfoResolvesAuthorizedAudio(t *testing.T) {
 		{"direct play disabled", `{"EnableDirectPlay":false}`},
 		{"over bitrate limit", `{"MaxStreamingBitrate":64000}`},
 		{"over channel limit", `{"MaxAudioChannels":1}`},
-		{"time seek", `{"StartTimeTicks":10000000}`},
-		{"demux required", `{"AudioStreamIndex":0}`},
+		{"negative time", `{"StartTimeTicks":-1}`},
+		{"nonexistent stream", `{"AudioStreamIndex":1}`},
 		{"unsupported audio profile", `{"DeviceProfile":{"DirectPlayProfiles":[{"Type":"Audio","Container":"mp3"}]}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -160,17 +169,22 @@ func TestThemePlaybackInfoResolvesAuthorizedAudio(t *testing.T) {
 }
 
 func TestThemePlaybackInfoConvertsThroughAdvertisedStream(t *testing.T) {
+	ffmpeg, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skip("ffmpeg is not installed")
+	}
+	ffprobe, err := exec.LookPath("ffprobe")
+	if err != nil {
+		t.Skip("ffprobe is not installed")
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "theme.ogg")
-	if err := os.WriteFile(path, []byte("source audio"), 0600); err != nil {
-		t.Fatal(err)
+	generate := exec.CommandContext(t.Context(), ffmpeg, "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=6", "-ac", "2", "-c:a", "libvorbis", path)
+	if out, err := generate.CombinedOutput(); err != nil {
+		t.Fatalf("generate source: %v: %s", err, out)
 	}
 	info, err := os.Stat(path)
 	if err != nil {
-		t.Fatal(err)
-	}
-	ffmpeg := filepath.Join(dir, "ffmpeg.sh")
-	if err := os.WriteFile(ffmpeg, []byte("#!/bin/sh\nprintf compat-aac\n"), 0700); err != nil {
 		t.Fatal(err)
 	}
 	store := &compatThemeFixture{file: themesongs.File{
@@ -182,7 +196,7 @@ func TestThemePlaybackInfoConvertsThroughAdvertisedStream(t *testing.T) {
 	playback := &PlaybackHandler{codec: codec, themeSongs: store, deviceProfiles: NewDeviceProfileStore(time.Hour, nil)}
 	items := &ItemsHandler{codec: codec, themeSongs: store, themeFFmpegPath: func() string { return ffmpeg }}
 	items.themeRouter = &themedelivery.Router{LocalConversion: func(context.Context) bool { return true }}
-	playback.themeCanConvert = items.themeRouter.CanConvert
+	playback.themeCanConvert = items.themeRouter.CanRouteConversion
 	sessions := NewSessionStore(time.Hour, nil)
 	if err := sessions.Put(Session{Token: "test-token", StreamAppUserID: 4, ProfileID: "profile"}); err != nil {
 		t.Fatal(err)
@@ -191,7 +205,7 @@ func TestThemePlaybackInfoConvertsThroughAdvertisedStream(t *testing.T) {
 	router.Post("/Items/{id}/PlaybackInfo", playback.HandlePlaybackInfo)
 	router.With(PlaybackSessionAuth(sessions, nil, nil)).Get("/Audio/{itemId}/stream.{container}", items.HandleThemeAudio)
 	id := EncodeNumericID(EncodedIDThemeSong, 8).String()
-	body := `{"MaxStreamingBitrate":96000,"StartTimeTicks":10000000,"DeviceProfile":{"TranscodingProfiles":[{"Type":"Audio","Protocol":"http","Container":"mp4","AudioCodec":"aac"}]}}`
+	body := `{"MaxStreamingBitrate":96000,"StartTimeTicks":10000000,"DeviceProfile":{"TranscodingProfiles":[{"Type":"Audio","Protocol":"http","Container":"mp4","AudioCodec":"aac","MaxAudioChannels":"1"}]}}`
 	request := httptest.NewRequest(http.MethodPost, "/Items/"+id+"/PlaybackInfo", strings.NewReader(body))
 	request = request.WithContext(context.WithValue(request.Context(), compatSessionKey, &Session{Token: "test-token", StreamAppUserID: 4, ProfileID: "profile"}))
 	w := httptest.NewRecorder()
@@ -207,7 +221,7 @@ func TestThemePlaybackInfoConvertsThroughAdvertisedStream(t *testing.T) {
 		t.Fatalf("media sources=%d", len(result.MediaSources))
 	}
 	source := result.MediaSources[0]
-	if source.SupportsDirectPlay || !source.SupportsTranscoding || source.Container != "mp4" || source.TranscodingSubProtocol != "http" || source.MediaStreams[0].Codec != "aac" || source.Bitrate > 96000 {
+	if source.SupportsDirectPlay || !source.SupportsTranscoding || source.Container != "mp4" || source.TranscodingSubProtocol != "http" || source.MediaStreams[0].Codec != "aac" || source.MediaStreams[0].Channels != 1 || source.Bitrate > 96000 {
 		t.Fatalf("converted source=%+v", source)
 	}
 	parsed, err := url.Parse(source.TranscodingURL)
@@ -216,8 +230,37 @@ func TestThemePlaybackInfoConvertsThroughAdvertisedStream(t *testing.T) {
 	}
 	w = httptest.NewRecorder()
 	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, source.TranscodingURL, nil))
-	if w.Code != http.StatusOK || w.Body.String() != "compat-aac" || w.Header().Get("Content-Type") != themesongs.ConvertedContentType {
+	if w.Code != http.StatusOK || w.Header().Get("Content-Type") != themesongs.ConvertedContentType {
 		t.Fatalf("converted stream status=%d body=%q headers=%v", w.Code, w.Body.String(), w.Header())
+	}
+	output := filepath.Join(dir, "converted.m4a")
+	if err := os.WriteFile(output, w.Body.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+	probe := exec.CommandContext(t.Context(), ffprobe, "-v", "error", "-select_streams", "a", "-show_entries", "stream=channels", "-of", "csv=p=0", output)
+	if out, err := probe.CombinedOutput(); err != nil || strings.TrimSpace(string(out)) != "1" {
+		t.Fatalf("converted channels: %v: %s", err, out)
+	}
+	decode := exec.CommandContext(t.Context(), ffmpeg, "-v", "error", "-xerror", "-i", output, "-f", "null", "-")
+	if out, err := decode.CombinedOutput(); err != nil {
+		t.Fatalf("decode converted theme: %v: %s", err, out)
+	}
+	// A policy change prevents new offers and preserves the existing stream's
+	// routing-error response, rather than reporting an unsupported client codec.
+	policy := config.DefaultPlaybackRoutingPolicy()
+	policy.RemuxExecution = config.PlaybackExecutionWorkerOnly
+	items.themeRouter.Policy = func() config.PlaybackRoutingPolicy { return policy }
+	denied := httptest.NewRequest(http.MethodPost, "/Items/"+id+"/PlaybackInfo", strings.NewReader(body))
+	denied = denied.WithContext(request.Context())
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, denied)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("unroutable conversion offered: %d %s", w.Code, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, source.TranscodingURL, nil))
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), compatRoutingPolicyUnsatisfiedCode) {
+		t.Fatalf("routing error changed: %d %s", w.Code, w.Body.String())
 	}
 }
 
@@ -249,7 +292,7 @@ func TestThemeDirectPlayFormats(t *testing.T) {
 		{"maxAudioBitRate=128000&maxAudioChannels=2&audioSampleRate=44100&audioStreamIndex=-1", "m4a", true},
 		{"audioCodec=mp3", "", false},
 		{"audioStreamIndex=1", "", false},
-		{"audioStreamIndex=0", "", false},
+		{"audioStreamIndex=0", "", true},
 		{"maxAudioBitRate=64000", "", false},
 		{"audioChannels=1", "", false},
 		{"audioSampleRate=48000", "", false},

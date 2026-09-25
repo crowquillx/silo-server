@@ -359,9 +359,24 @@ advertises progressive MP4/AAC audio conversion and a conversion route is
 available, an incompatible original is offered as a converted source instead.
 Codec and container profile conditions apply to the original and the proposed
 conversion output. Required properties that are unknown prevent that delivery.
-MP4, M4A and M4B audio labels share the same container checks.
-Converted audio uses roughly one-second MP4 fragments so it can stream before the
-encoder reaches the end of the source.
+
+Negotiation accepts the advertised default audio track and leaves direct-play
+seeking to client byte-range requests. Converted URLs retain the start offset.
+Direct-play and transcoding profiles with an omitted type default to Audio.
+An omitted transcoding protocol defaults to HTTP; static-only profiles do not
+authorize streaming. Supported mono and bitrate limits
+select the conversion output, and the stream URL carries those settings.
+
+MP4, M4A and M4B audio labels match interchangeably in positive container lists.
+Container and codec exclusions match the literal container, so excluding M4A does not exempt
+MP4 output from the conditions. PlaybackInfo conversion preflight checks routing
+policy, signing requirements and the client's access path without reserving
+capacity. A later stream can still fail if a worker becomes unavailable.
+
+Audio-only MP4 remux uses roughly one-second fragments so it can stream before the
+encoder reaches the end of the source. This also covers native audio-only playback
+and copy remux. Proxy and transcode nodes need the updated build for the fragment
+fix; older workers retain their previous behavior.
 The response has no `PlaySessionId`, because theme audio has no playback session.
 Unsupported formats and constraints return `400 PlaybackUnavailable`.
 

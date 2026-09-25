@@ -369,15 +369,49 @@ type nodeLister interface {
 	TranscodeNodeByURL(string) (*nodepool.Node, bool)
 }
 
-// CanConvert reports whether a conversion route could exist now: this node
-// runs the AAC recipe, or a worker advertises theme conversion. It ignores
-// policy and capacity, which only a resolution can settle.
+// CanConvert reports conversion capability, independently of routing policy.
+// Existing authorization callers leave policy failures to Resolve so they
+// retain their routing-error responses rather than blaming the client format.
 func (r *Router) CanConvert(ctx context.Context) bool {
+	return r.canConvert(ctx, nil, nil)
+}
+
+// CanRouteConversion is a negotiation preflight: a capable route must satisfy
+// policy, signing requirements and the client's access path. It reserves no
+// capacity; node health and capacity remain the stream's responsibility.
+func (r *Router) CanRouteConversion(ctx context.Context) bool {
 	if r == nil {
 		return false
 	}
-	if r.LocalConversion != nil && r.LocalConversion(ctx) {
+	policy := config.DefaultPlaybackRoutingPolicy()
+	if r.Policy != nil {
+		policy = r.Policy()
+	}
+	proxyAllowed := r.Secret != nil && strings.TrimSpace(r.Secret()) != ""
+	routes, err := noderouting.Candidates(noderouting.Request{
+		Workload: noderouting.WorkloadRemux, Delivery: noderouting.DeliveryProgressiveRemux,
+		Policy: policy, ProxyAllowed: proxyAllowed,
+	})
+	if err != nil {
+		return false
+	}
+	allowed := map[noderouting.Execution]bool{}
+	for _, shape := range routes.Candidates {
+		allowed[shape.Execution] = true
+	}
+	return r.canConvert(ctx, allowed, nodepool.ClientReachableVia(netaccess.PathFromContext(ctx), nil))
+}
+
+func (r *Router) canConvert(ctx context.Context, allowed map[noderouting.Execution]bool, reachable func(*nodepool.Node) bool) bool {
+	if r == nil {
+		return false
+	}
+
+	if (allowed == nil || allowed[noderouting.ExecutionAPI]) && r.LocalConversion != nil && r.LocalConversion(ctx) {
 		return true
+	}
+	if allowed != nil && !allowed[noderouting.ExecutionProxy] && !allowed[noderouting.ExecutionTranscode] {
+		return false
 	}
 	lister, ok := r.Planner.(nodeLister)
 	if !ok {
@@ -387,17 +421,17 @@ func (r *Router) CanConvert(ctx context.Context) bool {
 	relay := false
 	for _, nodeURL := range lister.ProxyNodeURLs() {
 		n, found := lister.ProxyNodeByURL(nodeURL)
-		if !found || !caps.has(n, playback.TransportFeatureThemeAudioEgressV1) {
+		if !found || !caps.has(n, playback.TransportFeatureThemeAudioEgressV1) || (reachable != nil && !reachable(n)) {
 			continue
 		}
-		if caps.convertsAAC(n) {
+		if (allowed == nil || allowed[noderouting.ExecutionProxy]) && caps.convertsAAC(n) {
 			return true
 		}
 		relay = relay || caps.has(n, playback.TransportFeatureProgressiveRemuxRelayV1)
 	}
 	// A transcode node's conversion reaches the client only through a proxy
 	// that serves themes and relays progressive remux, as Resolve requires.
-	if !relay || r.Recipes == nil || !r.Recipes.Enabled() {
+	if (allowed != nil && !allowed[noderouting.ExecutionTranscode]) || !relay || r.Recipes == nil || !r.Recipes.Enabled() {
 		return false
 	}
 	for _, nodeURL := range lister.TranscodeNodeURLs() {

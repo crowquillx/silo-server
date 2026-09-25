@@ -322,9 +322,85 @@ func TestCanConvertMatchesResolvableRoutes(t *testing.T) {
 			if got := router.CanConvert(t.Context()); got != tc.want {
 				t.Fatalf("CanConvert = %v, want %v", got, tc.want)
 			}
+			router.Secret = func() string { return testSecret }
+			if got := router.CanRouteConversion(t.Context()); got != tc.want {
+				t.Fatalf("preflight=%v want=%v", got, tc.want)
+			}
 		})
 	}
 	if !(&Router{LocalConversion: func(context.Context) bool { return true }}).CanConvert(t.Context()) {
 		t.Fatal("local AAC recipe not counted")
+	}
+}
+
+func TestCanRouteConversionHonorsRoutingPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name                       string
+		execution                  config.PlaybackExecutionPreference
+		egress                     config.PlaybackEgressPreference
+		local, proxy, secret, want bool
+	}{
+		{"local allowed", config.PlaybackExecutionAPIOnly, config.PlaybackEgressAPIOnly, true, false, false, true},
+		{"local forbidden", config.PlaybackExecutionWorkerOnly, config.PlaybackEgressProxyOnly, true, false, true, false},
+		{"worker forbidden", config.PlaybackExecutionAPIOnly, config.PlaybackEgressAPIOnly, false, true, true, false},
+		{"worker allowed", config.PlaybackExecutionWorkerOnly, config.PlaybackEgressProxyOnly, false, true, true, true},
+		{"worker requires signing secret", config.PlaybackExecutionWorkerOnly, config.PlaybackEgressProxyOnly, false, true, false, false},
+		{"no legal progressive shape", config.PlaybackExecutionWorkerOnly, config.PlaybackEgressAPIOnly, true, true, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			policy := config.DefaultPlaybackRoutingPolicy()
+			policy.RemuxExecution = tc.execution
+			policy.RemuxEgress = tc.egress
+			planner := &listingPlanner{}
+			if tc.proxy {
+				planner.proxies = []*nodepool.Node{themeProxy(t)}
+			}
+			router := &Router{Planner: planner, Policy: func() config.PlaybackRoutingPolicy { return policy }, LocalConversion: func(context.Context) bool { return tc.local }}
+			if tc.secret {
+				router.Secret = func() string { return testSecret }
+			}
+			if got := router.CanRouteConversion(t.Context()); got != tc.want {
+				t.Fatalf("CanConvert=%v want=%v", got, tc.want)
+			}
+			result, err := router.Resolve(t.Context(), themeRequest(themesongs.DeliveryConverted))
+			if (err == nil) != tc.want {
+				t.Fatalf("Resolve=%+v err=%v want available=%v", result, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestConversionPreflightChecksClientAccessPath(t *testing.T) {
+	proxy := themeProxy(t)
+	policy := config.DefaultPlaybackRoutingPolicy()
+	policy.RemuxExecution = config.PlaybackExecutionWorkerOnly
+	router := &Router{Planner: &listingPlanner{fakePlanner{proxies: []*nodepool.Node{proxy}}}, Secret: func() string { return testSecret }, Policy: func() config.PlaybackRoutingPolicy { return policy }}
+	path := netaccess.Path{Provider: "overlay"}
+	ctx := netaccess.WithPath(t.Context(), path)
+	if router.CanRouteConversion(ctx) {
+		t.Fatal("conversion preflight offered an unreachable proxy")
+	}
+	proxy.NetworkAccess = netaccess.NodeNetworkAccess{"overlay": {State: netaccess.StateConnected, Origin: "https://proxy.example"}}
+	if !router.CanRouteConversion(ctx) {
+		t.Fatal("reachable converting proxy was rejected")
+	}
+	req := themeRequest(themesongs.DeliveryConverted)
+	req.AccessPath = path
+	result, err := router.Resolve(ctx, req)
+	if err != nil || !strings.HasPrefix(result.URL, "https://proxy.example/") {
+		t.Fatalf("route=%+v err=%v", result, err)
+	}
+}
+
+func TestConversionCapabilityPreservesPolicyFailure(t *testing.T) {
+	policy := config.DefaultPlaybackRoutingPolicy()
+	policy.RemuxExecution = config.PlaybackExecutionWorkerOnly
+	router := &Router{Policy: func() config.PlaybackRoutingPolicy { return policy }, LocalConversion: func(context.Context) bool { return true }}
+	if !router.CanConvert(t.Context()) {
+		t.Fatal("routing policy must not change the existing capability contract")
+	}
+	_, err := router.Resolve(t.Context(), themeRequest(themesongs.DeliveryConverted))
+	if !errors.Is(err, ErrPolicyUnsatisfied) {
+		t.Fatalf("expected policy failure for caller's 503 mapping, got %v", err)
 	}
 }

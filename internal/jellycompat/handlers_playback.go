@@ -2088,7 +2088,7 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusUnauthorized, "Unauthorized", "Missing authentication token")
 		return
 	}
-	if themeID, err := h.codec.DecodeIntID(EncodedIDThemeSong, chi.URLParam(r, "id")); err == nil {
+	if themeID, ok := decodeThemePlaybackID(chi.URLParam(r, "id")); ok {
 		h.handleThemePlaybackInfo(w, r, session, themeID)
 		return
 	}

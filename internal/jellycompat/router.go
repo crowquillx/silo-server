@@ -171,7 +171,7 @@ func NewRouter(deps Dependencies) chi.Router {
 	playbackHandler.SettingsRepo = deps.SettingsRepo
 	playbackHandler.RecipeNodeStore = deps.RecipeNodeStore
 	itemsHandler.themeRouter = compatThemeRouter(deps, playbackHandler)
-	playbackHandler.themeCanConvert = itemsHandler.themeRouter.CanConvert
+	playbackHandler.themeCanConvert = itemsHandler.themeRouter.CanRouteConversion
 	itemsHandler.themeFFmpegPath = func() string { return playback.ResolveFFmpegPath(playbackHandler.FFmpegPath) }
 	playbackHandler.SessionSyncer = deps.SessionSyncer
 	playbackHandler.WatchScrobbler = deps.WatchScrobbler
