@@ -351,6 +351,17 @@ Omitting `inheritFromParent` defaults to `false`, as in Jellyfin.
 Theme IDs are stable numeric encodings that survive a server restart.
 Theme items include `ServerId` and can be fetched through `GET /Items/{id}`
 or `/Users/{userId}/Items/{id}` before playback. These lookups recheck visibility.
+`GET` and `POST /Items/{themeId}/PlaybackInfo` (including the `/Users/{userId}`
+aliases) resolve the synthetic theme ID against the same visible theme file.
+They return one audio source with an authenticated `/Audio` stream URL. The
+original is offered when its format and playback limits fit. When a client
+advertises progressive MP4/AAC audio conversion and a conversion route is
+available, an incompatible original is offered as a converted source instead.
+Codec and container profile conditions apply to the original and the proposed
+conversion output. Required properties that are unknown prevent that delivery.
+MP4, M4A and M4B audio labels share the same container checks.
+The response has no `PlaySessionId`, because theme audio has no playback session.
+Unsupported formats and constraints return `400 PlaybackUnavailable`.
 
 The authenticated `GET|HEAD /Audio/{itemId}/stream`,
 `/Audio/{itemId}/stream.{container}`, and `/Audio/{itemId}/universal` routes

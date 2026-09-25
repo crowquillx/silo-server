@@ -5,7 +5,9 @@ import (
 	"errors"
 	"math/rand/v2"
 	"net/http"
+	"net/url"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -28,6 +30,8 @@ const (
 	compatThemeSeason     = "season"
 	compatThemeAudioRate  = "audioBitRate"
 	compatThemeMaxRate    = "maxStreamingBitrate"
+	compatThemeFile       = "File"
+	compatThemeHTTP       = "http"
 )
 
 type themeSongStore interface {
@@ -263,6 +267,209 @@ func themeConversionAllowed(query caseInsensitiveQuery, routeContainer string, f
 		}
 	}
 	return conversion, seekSeconds, "", true
+}
+
+// handleThemePlaybackInfo negotiates the original or progressive AAC delivery
+// supported by HandleThemeAudio. Theme songs have no native playback session.
+func (h *PlaybackHandler) handleThemePlaybackInfo(w http.ResponseWriter, r *http.Request, session *Session, themeID int64) {
+	if userID := chi.URLParam(r, "userId"); userID != "" && !validatePseudoUser(w, userID, session) {
+		return
+	}
+	if h.themeSongs == nil {
+		writeError(w, http.StatusServiceUnavailable, "Unavailable", "Theme audio unavailable")
+		return
+	}
+	filter := withCompatAccessExclusions(catalog.AccessFilter{})
+	if h.accessFilter != nil {
+		filter = withCompatAccessExclusions(h.accessFilter(r.Context(), session.StreamAppUserID, session.ProfileID))
+	}
+	file, err := h.themeSongs.Find(r.Context(), strconv.FormatInt(themeID, 10), filter)
+	if err != nil {
+		writeThemeLookupError(w, err)
+		return
+	}
+	req, profile, err := h.parsePlaybackRequest(r, session.Token)
+	if err != nil {
+		writeDeviceProfileRequestError(w, err, "Invalid playback request")
+		return
+	}
+	serverCap, err := h.serverBitrateCap(r.Context(), session)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "PlaybackUnavailable", "The server could not resolve the stream bitrate limit")
+		return
+	}
+	constraints := url.Values{}
+	if !boolDefault(req.EnableDirectPlay, true) {
+		constraints.Set("enableDirectPlay", "false")
+	}
+	if req.StartTimeTicks != 0 {
+		constraints.Set("startTimeTicks", strconv.FormatInt(req.StartTimeTicks, 10))
+	}
+	if req.AudioStreamIndex != nil {
+		constraints.Set("audioStreamIndex", strconv.Itoa(int(*req.AudioStreamIndex)))
+	}
+	if req.MaxAudioChannels > 0 {
+		constraints.Set("maxAudioChannels", strconv.Itoa(req.MaxAudioChannels))
+	}
+	maxBitrate := req.MaxStreamingBitrate
+	for _, cap := range []int64{profile.MaxStreamingBitrate, int64(serverCap) * 1000} {
+		if cap > 0 && (maxBitrate <= 0 || cap < maxBitrate) {
+			maxBitrate = cap
+		}
+	}
+	if maxBitrate > 0 {
+		constraints.Set("maxStreamingBitrate", strconv.FormatInt(maxBitrate, 10))
+	}
+	id := EncodeNumericID(EncodedIDThemeSong, uint64(themeID)).String()
+	direct := themeDirectPlayAllowed(newCaseInsensitiveQuery(constraints), "", file, false) && themeAudioProfileAllows(profile, file)
+	container, codec, channels, bitrate := strings.ToLower(file.Container), file.AudioCodec, file.AudioChannels, file.BitrateKbps
+	streamURL := "/Audio/" + id + "/stream." + url.PathEscape(container)
+	if direct {
+		constraints.Set("static", "true")
+	} else {
+		if !boolDefault(req.EnableTranscoding, true) || h.themeCanConvert == nil || !h.themeCanConvert(r.Context()) {
+			writeError(w, http.StatusBadRequest, "PlaybackUnavailable", "The theme cannot be played with the requested audio constraints")
+			return
+		}
+		// Name the progressive MP4 target and force conversion even when the
+		// source is already MP4 but direct play was disabled by the client.
+		constraints.Set("enableDirectPlay", "false")
+		constraints.Set("audioCodec", themesongs.CodecAAC)
+		conversion, _, _, ok := themeConversionAllowed(newCaseInsensitiveQuery(constraints), compatContainerMP4, file, false)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "PlaybackUnavailable", "The theme cannot be converted with the requested audio constraints")
+			return
+		}
+		container, codec, channels, bitrate = compatContainerMP4, themesongs.CodecAAC, conversion.Channels, conversion.BitrateKbps
+		output := themesongs.File{
+			Song: themesongs.Song{Container: container}, AudioCodec: codec,
+			AudioChannels: channels, BitrateKbps: bitrate,
+		}
+		if !themeAACProfileAllows(profile, output) {
+			writeError(w, http.StatusBadRequest, "PlaybackUnavailable", "The converted theme does not meet the client's audio profile")
+			return
+		}
+		streamURL = "/Audio/" + id + "/stream.mp4"
+	}
+	constraints.Set("api_key", session.Token)
+	streamURL += "?" + constraints.Encode()
+	audioIndex := 0
+	source := mediaSourceDTO{
+		Protocol: compatThemeFile, ID: id, Type: compatSubtitleDefault, Container: container,
+		Name: file.Title, RunTimeTicks: int64(file.DurationSeconds) * 10000000,
+		SupportsDirectPlay: direct, SupportsTranscoding: !direct, SupportsProbing: true,
+		Formats: []string{container}, RequiredHTTPHeaders: map[string]string{}, MediaAttachments: []map[string]any{},
+		Bitrate: bitrate * 1000, DefaultAudioStreamIndex: &audioIndex,
+		MediaStreams: []mediaStreamDTO{{Index: 0, Type: compatThemeAudio, Codec: codec, Channels: channels, BitRate: bitrate * 1000, IsDefault: true}},
+	}
+	if direct {
+		source.Size = file.Size
+		source.DirectStreamURL = streamURL
+	} else {
+		source.TranscodingContainer = container
+		source.TranscodingSubProtocol = compatThemeHTTP
+		source.TranscodingURL = streamURL
+	}
+	writeJSON(w, http.StatusOK, playbackInfoResponseDTO{MediaSources: []mediaSourceDTO{source}})
+}
+
+func themeAudioProfileAllows(profile DeviceProfile, file themesongs.File) bool {
+	if !themeAudioConditionsAllow(profile, file) {
+		return false
+	}
+	for _, direct := range profile.DirectPlayProfiles {
+		if !strings.EqualFold(direct.Type, compatThemeAudio) {
+			continue
+		}
+		if themeProfileContainerMatches(direct.Container, file.Container) && matchesCSV(direct.AudioCodec, file.AudioCodec) {
+			return true
+		}
+	}
+	// The generic profile and some clients only advertise video capabilities.
+	// Their theme audio still uses the original-only stream route.
+	return !slices.ContainsFunc(profile.DirectPlayProfiles, func(p DirectPlayProfile) bool {
+		return strings.EqualFold(p.Type, compatThemeAudio)
+	}) && !slices.ContainsFunc(profile.TranscodingProfiles, func(p TranscodingProfile) bool {
+		return strings.EqualFold(p.Type, compatThemeAudio)
+	})
+}
+
+func themeAACProfileAllows(profile DeviceProfile, output themesongs.File) bool {
+	if !themeAudioConditionsAllow(profile, output) {
+		return false
+	}
+	for _, conversion := range profile.TranscodingProfiles {
+		if !strings.EqualFold(conversion.Type, compatThemeAudio) ||
+			!strings.EqualFold(conversion.Protocol, compatThemeHTTP) ||
+			(conversion.Container == "" || !themeProfileContainerMatches(conversion.Container, compatContainerMP4)) ||
+			!matchesCSV(conversion.AudioCodec, themesongs.CodecAAC) {
+			continue
+		}
+		if conversion.MaxAudioChannels != "" {
+			maxChannels, err := strconv.Atoi(conversion.MaxAudioChannels)
+			if err != nil || maxChannels <= 0 || output.AudioChannels > maxChannels {
+				continue
+			}
+		}
+		if !conditionsMatch(conversion.Conditions, themeAudioConditionValues(output)) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// Theme metadata contains only these audio facts. In particular, conversion
+// does not promise the source's sample rate or codec profile. Missing values
+// use the shared evaluator's required/optional condition semantics.
+func themeAudioConditionValues(file themesongs.File) conditionValues {
+	values := conditionValues{}
+	for property, value := range map[string]int{
+		"audiochannels":   file.AudioChannels,
+		"audiobitrate":    file.BitrateKbps * 1000,
+		"audiosamplerate": file.SampleRate,
+	} {
+		if fact := intConditionValue(value); fact.hasNum {
+			values[property] = fact
+		}
+	}
+	return values
+}
+
+func themeAudioConditionsAllow(profile DeviceProfile, file themesongs.File) bool {
+	values := themeAudioConditionValues(file)
+	for _, container := range profile.ContainerProfiles {
+		audio := container.Type == "" || container.Type == "*" || strings.EqualFold(container.Type, compatThemeAudio)
+		if audio && themeProfileContainerMatches(container.Container, file.Container) && !conditionsMatch(container.Conditions, values) {
+			return false
+		}
+	}
+	version := catalog.FileVersion{Container: file.Container, CodecAudio: file.AudioCodec}
+	for _, codec := range profile.CodecProfiles {
+		if strings.EqualFold(codec.Type, compatThemeAudio) && codecProfileApplies(codec, version, nil, themeProfileContainers(file.Container), false) &&
+			conditionsMatch(codec.ApplyConditions, values) && !conditionsMatch(codec.Conditions, values) {
+			return false
+		}
+	}
+	return true
+}
+
+func themeProfileContainerMatches(profile, container string) bool {
+	for alias := range strings.SplitSeq(themeProfileContainers(container), ",") {
+		if matchesCSV(profile, alias) {
+			return true
+		}
+	}
+	return false
+}
+
+// Theme delivery accepts MP4 audio extensions interchangeably. Give codec
+// profiles the complete alias set so their exclusion lists keep that meaning.
+func themeProfileContainers(container string) string {
+	if themeContainerFormat(strings.ToLower(strings.TrimSpace(container))) == compatContainerMP4 {
+		return "mp4,m4a,m4b"
+	}
+	return container
 }
 
 func writeThemeLookupError(w http.ResponseWriter, err error) {

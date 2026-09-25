@@ -303,6 +303,9 @@ type PlaybackHandler struct {
 	cfg                     *config.Config
 	content                 ContentService
 	codec                   *ResourceIDCodec
+	themeSongs              themeSongStore
+	accessFilter            AccessFilterResolver
+	themeCanConvert         func(context.Context) bool
 	deviceProfiles          *DeviceProfileStore
 	playbackStore           CompatPlaybackStore
 	sessionMgr              SessionManagerInterface
@@ -2083,6 +2086,10 @@ func (h *PlaybackHandler) HandlePlaybackInfo(w http.ResponseWriter, r *http.Requ
 	session := SessionFromContext(r.Context())
 	if session == nil {
 		writeError(w, http.StatusUnauthorized, "Unauthorized", "Missing authentication token")
+		return
+	}
+	if themeID, err := h.codec.DecodeIntID(EncodedIDThemeSong, chi.URLParam(r, "id")); err == nil {
+		h.handleThemePlaybackInfo(w, r, session, themeID)
 		return
 	}
 
