@@ -260,6 +260,13 @@ func buildRemuxArgsWithAudioV3(filePath, outputFormat string, seekSeconds float6
 		args = append(args, "-c", "copy")
 	}
 
+	if audioOnly {
+		// Audio has no video keyframes to end a fragment. Bound fragments so
+		// playback can start before EOF and large track-run boxes cannot exceed
+		// the MP4 muxer's seek-back buffer on a non-seekable output pipe.
+		args = append(args, "-frag_duration", "1000000")
+	}
+
 	args = append(args,
 		"-avoid_negative_ts", "make_zero",
 		"-f", outputFormat,

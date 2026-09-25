@@ -360,6 +360,8 @@ available, an incompatible original is offered as a converted source instead.
 Codec and container profile conditions apply to the original and the proposed
 conversion output. Required properties that are unknown prevent that delivery.
 MP4, M4A and M4B audio labels share the same container checks.
+Converted audio uses roughly one-second MP4 fragments so it can stream before the
+encoder reaches the end of the source.
 The response has no `PlaySessionId`, because theme audio has no playback session.
 Unsupported formats and constraints return `400 PlaybackUnavailable`.
 
